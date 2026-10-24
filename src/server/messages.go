@@ -324,9 +324,11 @@ func (s *Server) SendMessage(ctx context.Context, req *__.MessageRequest) (*__.M
 		}
 		paramsJson, _ := json.Marshal(map[string]any{"from": "api", "templateId": random.String(16)})
 		interactive := &waE2E.InteractiveMessage{
-			NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-				Buttons:           nativeButtons,
-				MessageParamsJSON: proto.String(string(paramsJson)),
+			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+					Buttons:           nativeButtons,
+					MessageParamsJSON: proto.String(string(paramsJson)),
+				},
 			},
 			ContextInfo: contextInfo,
 		}
