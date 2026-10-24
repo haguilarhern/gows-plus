@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -276,6 +277,108 @@ func (s *Server) SendMessage(ctx context.Context, req *__.MessageRequest) (*__.M
 			}},
 		}
 		extra.AdditionalNodes = &[]waBinary.Node{node}
+
+	} else if req.Buttons != nil {
+		// Interactive buttons (native flow). Phones render these only when the stanza carries the
+		// <biz><interactive type="native_flow"> node (+ <bot biz_bot="1"> in 1:1 chats), the message
+		// has a messageSecret and is NOT wrapped in viewOnceMessage. Verified on Android, Oct 2026.
+		b := req.Buttons
+		if len(b.Buttons) == 0 {
+			return nil, status.Error(codes.InvalidArgument, "buttons: at least one button is required")
+		}
+		if len(b.Buttons) > 10 {
+			return nil, status.Error(codes.InvalidArgument, "buttons: at most 10 buttons")
+		}
+		hasReply, hasCta := false, false
+		nativeButtons := make([]*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton, 0, len(b.Buttons))
+		for _, btn := range b.Buttons {
+			params := map[string]any{"display_text": btn.Text, "id": firstNonEmpty(btn.GetId(), random.String(16)), "disabled": false}
+			var name string
+			switch btn.Type {
+			case "reply":
+				name, hasReply = "quick_reply", true
+			case "url":
+				name, hasCta = "cta_url", true
+				params["url"] = btn.GetUrl()
+				params["merchant_url"] = btn.GetUrl()
+			case "call":
+				name, hasCta = "cta_call", true
+				params["phone_number"] = btn.GetPhoneNumber()
+			case "copy":
+				name, hasCta = "cta_copy", true
+				params["copy_code"] = btn.GetCopyCode()
+			default:
+				return nil, status.Errorf(codes.InvalidArgument, "buttons: unknown button type '%s' (reply|url|call|copy)", btn.Type)
+			}
+			paramsJson, err := json.Marshal(params)
+			if err != nil {
+				return nil, err
+			}
+			nativeButtons = append(nativeButtons, &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
+				Name:             proto.String(name),
+				ButtonParamsJSON: proto.String(string(paramsJson)),
+			})
+		}
+		if hasReply && hasCta {
+			return nil, status.Error(codes.InvalidArgument, "buttons: reply buttons cannot be mixed with url/call/copy buttons")
+		}
+		paramsJson, _ := json.Marshal(map[string]any{"from": "api", "templateId": random.String(16)})
+		interactive := &waE2E.InteractiveMessage{
+			NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+				Buttons:           nativeButtons,
+				MessageParamsJSON: proto.String(string(paramsJson)),
+			},
+			ContextInfo: contextInfo,
+		}
+		if b.GetBody() != "" {
+			interactive.Body = &waE2E.InteractiveMessage_Body{Text: proto.String(b.GetBody())}
+		}
+		if b.GetFooter() != "" {
+			interactive.Footer = &waE2E.InteractiveMessage_Footer{Text: proto.String(b.GetFooter())}
+		}
+		if b.GetHeader() != "" || b.HeaderImage != nil {
+			header := &waE2E.InteractiveMessage_Header{HasMediaAttachment: proto.Bool(false)}
+			if b.GetHeader() != "" {
+				header.Title = proto.String(b.GetHeader())
+			}
+			if b.HeaderImage != nil && len(b.HeaderImage.GetContent()) > 0 {
+				uploaded, err := cli.Upload(ctx, b.HeaderImage.GetContent(), whatsmeow.MediaImage)
+				if err != nil {
+					return nil, fmt.Errorf("buttons: failed to upload header image: %w", err)
+				}
+				mimetype := firstNonEmpty(b.HeaderImage.GetMimetype(), "image/jpeg")
+				header.HasMediaAttachment = proto.Bool(true)
+				header.Media = &waE2E.InteractiveMessage_Header_ImageMessage{ImageMessage: &waE2E.ImageMessage{
+					URL:           proto.String(uploaded.URL),
+					DirectPath:    proto.String(uploaded.DirectPath),
+					MediaKey:      uploaded.MediaKey,
+					Mimetype:      proto.String(mimetype),
+					FileEncSHA256: uploaded.FileEncSHA256,
+					FileSHA256:    uploaded.FileSHA256,
+					FileLength:    proto.Uint64(uploaded.FileLength),
+				}}
+			}
+			interactive.Header = header
+		}
+		message = &waE2E.Message{
+			InteractiveMessage: interactive,
+			MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: random.Bytes(32)},
+		}
+		nodes := []waBinary.Node{{
+			Tag: "biz",
+			Content: []waBinary.Node{{
+				Tag:   "interactive",
+				Attrs: waBinary.Attrs{"type": "native_flow", "v": "1"},
+				Content: []waBinary.Node{{
+					Tag:   "native_flow",
+					Attrs: waBinary.Attrs{"v": "9", "name": "mixed"},
+				}},
+			}},
+		}}
+		if jid.Server != types.GroupServer {
+			nodes = append(nodes, waBinary.Node{Tag: "bot", Attrs: waBinary.Attrs{"biz_bot": "1"}})
+		}
+		extra.AdditionalNodes = &nodes
 
 	} else if req.Location != nil {
 		// Location Message
@@ -864,4 +967,13 @@ func (s *Server) CancelEventMessage(ctx context.Context, req *__.CancelEventMess
 		Message:   data,
 	}
 	return &msg, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
